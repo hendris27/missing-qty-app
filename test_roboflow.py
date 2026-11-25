@@ -236,7 +236,7 @@ def require_model_change_password():
 
 def model_label_for_number(model_number):
     if model_number is None:
-        return "Belum ada model"
+        return "Select model"
     if 1 <= model_number <= len(MODEL_CONFIG):
         return MODEL_CONFIG[model_number - 1][0]
     return f"Model {model_number}"
@@ -347,6 +347,22 @@ def fill_rounded_gradient(image, box, top_color, bottom_color, radius):
     )
     region = image[y1:y2 + 1, x1:x2 + 1]
     region[mask > 0] = gradient[mask > 0]
+
+
+def draw_control_icon_button(image, x, y, width, height, radius):
+    draw_rounded_rectangle(
+        image,
+        (x - 2, y - 2, x + width + 2, y + height + 2),
+        (35, 205, 255),
+        radius + 2,
+    )
+    fill_rounded_gradient(
+        image,
+        (x, y, x + width, y + height),
+        (35, 150, 255),
+        (0, 86, 225),
+        radius,
+    )
 
 
 def draw_monitor_icon(image, center, size, color, thickness=2):
@@ -479,27 +495,189 @@ if not camera.isOpened():
     raise SystemExit("Kamera tidak ditemukan. Coba ganti camera ID.")
 
 window_name = "Capture Tray PCB"
-cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-cv2.setWindowProperty(
-    window_name,
-    cv2.WND_PROP_FULLSCREEN,
-    cv2.WINDOW_FULLSCREEN,
+
+
+class MonitorRect(ctypes.Structure):
+    _fields_ = [
+        ("left", ctypes.c_long),
+        ("top", ctypes.c_long),
+        ("right", ctypes.c_long),
+        ("bottom", ctypes.c_long),
+    ]
+
+
+class MonitorInfo(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.c_uint32),
+        ("rcMonitor", MonitorRect),
+        ("rcWork", MonitorRect),
+        ("dwFlags", ctypes.c_uint32),
+    ]
+
+
+monitors = []
+monitor_callback_type = ctypes.WINFUNCTYPE(
+    ctypes.c_int,
+    ctypes.c_void_p,
+    ctypes.c_void_p,
+    ctypes.POINTER(MonitorRect),
+    ctypes.c_void_p,
 )
-screen_width = ctypes.windll.user32.GetSystemMetrics(0)
-screen_height = ctypes.windll.user32.GetSystemMetrics(1)
+
+
+def collect_monitor(monitor, _device_context, _rect, _data):
+    info = MonitorInfo()
+    info.cbSize = ctypes.sizeof(MonitorInfo)
+    if ctypes.windll.user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+        bounds = info.rcMonitor
+        monitors.append(
+            (
+                bounds.left,
+                bounds.top,
+                bounds.right,
+                bounds.bottom,
+                bool(info.dwFlags & 1),
+            )
+        )
+    return 1
+
+
+monitor_callback = monitor_callback_type(collect_monitor)
+ctypes.windll.user32.GetMonitorInfoW.argtypes = [
+    ctypes.c_void_p,
+    ctypes.POINTER(MonitorInfo),
+]
+ctypes.windll.user32.GetMonitorInfoW.restype = ctypes.c_int
+ctypes.windll.user32.EnumDisplayMonitors.argtypes = [
+    ctypes.c_void_p,
+    ctypes.c_void_p,
+    monitor_callback_type,
+    ctypes.c_void_p,
+]
+ctypes.windll.user32.EnumDisplayMonitors.restype = ctypes.c_int
+if not ctypes.windll.user32.EnumDisplayMonitors(
+    None,
+    None,
+    monitor_callback,
+    None,
+):
+    print("Gagal membaca daftar monitor; memakai monitor utama.")
+
+secondary_monitors = [monitor for monitor in monitors if not monitor[4]]
+if secondary_monitors:
+    target_monitor = sorted(
+        secondary_monitors,
+        key=lambda monitor: (monitor[0], monitor[1]),
+    )[0]
+else:
+    target_monitor = next(
+        (monitor for monitor in monitors if monitor[4]),
+        None,
+    )
+    if target_monitor is not None and len(monitors) <= 1:
+        print("Monitor kedua tidak terdeteksi; memakai monitor utama.")
+
+if target_monitor is None:
+    monitor_left = 0
+    monitor_top = 0
+    screen_width = ctypes.windll.user32.GetSystemMetrics(0)
+    screen_height = ctypes.windll.user32.GetSystemMetrics(1)
+    use_secondary_monitor = False
+else:
+    monitor_left, monitor_top, monitor_right, monitor_bottom, is_primary = target_monitor
+    screen_width = monitor_right - monitor_left
+    screen_height = monitor_bottom - monitor_top
+    use_secondary_monitor = not is_primary
+
+if use_secondary_monitor:
+    print(
+        f"Monitor kedua dipilih: {screen_width}x{screen_height} "
+        f"di posisi ({monitor_left}, {monitor_top})"
+    )
+else:
+    print(
+        f"Monitor utama dipilih: {screen_width}x{screen_height} "
+        f"di posisi ({monitor_left}, {monitor_top})"
+    )
+
+cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+if not use_secondary_monitor:
+    cv2.setWindowProperty(
+        window_name,
+        cv2.WND_PROP_FULLSCREEN,
+        cv2.WINDOW_FULLSCREEN,
+    )
+
+
+def fit_window_to_secondary_monitor():
+    window_handle = ctypes.windll.user32.FindWindowW(None, window_name)
+    if not window_handle:
+        return False
+
+    style_index = -16
+    window_style = ctypes.windll.user32.GetWindowLongW(
+        window_handle,
+        style_index,
+    )
+    ctypes.windll.user32.SetWindowLongW(
+        window_handle,
+        style_index,
+        (window_style & ~0x00CF0000 & ~0x00080000) | 0x80000000,
+    )
+    if not ctypes.windll.user32.SetWindowPos(
+        window_handle,
+        ctypes.c_void_p(-1),
+        monitor_left,
+        monitor_top,
+        screen_width,
+        screen_height,
+        0x0020 | 0x0040,
+    ):
+        return False
+
+    ctypes.windll.user32.ShowWindow(window_handle, 5)
+    ctypes.windll.user32.BringWindowToTop(window_handle)
+    ctypes.windll.user32.SetForegroundWindow(window_handle)
+    ctypes.windll.user32.UpdateWindow(window_handle)
+    return True
+
+
+ctypes.windll.user32.FindWindowW.argtypes = [
+    ctypes.c_wchar_p,
+    ctypes.c_wchar_p,
+]
+ctypes.windll.user32.FindWindowW.restype = ctypes.c_void_p
+ctypes.windll.user32.GetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+ctypes.windll.user32.GetWindowLongW.restype = ctypes.c_long
+ctypes.windll.user32.SetWindowLongW.argtypes = [
+    ctypes.c_void_p,
+    ctypes.c_int,
+    ctypes.c_long,
+]
+ctypes.windll.user32.SetWindowLongW.restype = ctypes.c_long
+ctypes.windll.user32.SetWindowPos.argtypes = [
+    ctypes.c_void_p,
+    ctypes.c_void_p,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_uint,
+]
+ctypes.windll.user32.SetWindowPos.restype = ctypes.c_int
+ctypes.windll.user32.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+ctypes.windll.user32.BringWindowToTop.argtypes = [ctypes.c_void_p]
+ctypes.windll.user32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
+ctypes.windll.user32.UpdateWindow.argtypes = [ctypes.c_void_p]
+
+window_positioned = not use_secondary_monitor
 outer_margin = max(8, round(screen_height * 0.02))
 camera_padding = max(8, round(screen_height * 0.01))
 camera_horizontal_expand = min(
     max(1, round(screen_width * 0.01)),
     max(1, camera_padding),
 )
-one_centimeter = round(ctypes.windll.user32.GetDpiForSystem() / 2.54)
-camera_right = (
-    round(screen_width * 0.46)
-    - 4 * one_centimeter
-    + camera_horizontal_expand
-    + 16
-)
+camera_right = round(screen_width * 0.40)
 alert_path = Path(__file__).resolve().parent / "ok-alert.mp3"
 alert_alias = "tray_qty_ok_alert"
 alert_is_open = False
@@ -589,10 +767,15 @@ model_control_height = max(44, round(screen_height * 0.075))
 model_footer_padding = max(8, round(screen_height * 0.018))
 model_footer_top = model_control_y - model_footer_padding
 model_footer_bottom = model_control_y + model_control_height + model_footer_padding
-model_caption_area_width = round(qty_panel_width * 0.18)
-control_gap = max(8, round(qty_panel_width * 0.015))
+if use_secondary_monitor:
+    model_caption_area_width = model_control_height
+    control_gap = max(12, round(qty_panel_width * 0.025))
+    model_change_width = model_control_height
+else:
+    model_caption_area_width = round(qty_panel_width * 0.18)
+    control_gap = max(8, round(qty_panel_width * 0.015))
+    model_change_width = round(qty_panel_width * 0.22)
 model_dropdown_width = round(qty_panel_width * 0.48)
-model_change_width = round(qty_panel_width * 0.22)
 model_controls_width = (
     model_caption_area_width
     + model_dropdown_width
@@ -1093,11 +1276,27 @@ try:
         )
 
         control_center_y = model_control_y + model_control_height // 2
-        monitor_size = min(
-            round(model_control_height * 0.48),
-            round(model_caption_area_width * 0.34),
+        icon_button_radius = max(10, round(model_control_height * 0.18))
+        if use_secondary_monitor:
+            draw_control_icon_button(
+                display,
+                model_label_left,
+                model_control_y,
+                model_caption_area_width,
+                model_control_height,
+                icon_button_radius,
+            )
+            monitor_size = round(model_control_height * 0.52)
+        else:
+            monitor_size = min(
+                round(model_control_height * 0.48),
+                round(model_caption_area_width * 0.34),
+            )
+        monitor_center_x = model_label_left + (
+            model_caption_area_width // 2
+            if use_secondary_monitor
+            else round(model_caption_area_width * 0.24)
         )
-        monitor_center_x = model_label_left + round(model_caption_area_width * 0.24)
         draw_monitor_icon(
             display,
             (monitor_center_x, control_center_y),
@@ -1105,28 +1304,29 @@ try:
             (245, 249, 255),
             max(2, round(screen_height / 558 * 1.5)),
         )
-        model_caption = "Model"
-        model_caption_scale = screen_height / 558 * 0.48
-        model_caption_thickness = max(1, round(screen_height / 558 * 1.2))
-        (_, model_caption_height), _ = cv2.getTextSize(
-            model_caption,
-            cv2.FONT_HERSHEY_DUPLEX,
-            model_caption_scale,
-            model_caption_thickness,
-        )
-        cv2.putText(
-            display,
-            model_caption,
-            (
-                model_label_left + round(model_caption_area_width * 0.43),
-                control_center_y + model_caption_height // 2,
-            ),
-            cv2.FONT_HERSHEY_DUPLEX,
-            model_caption_scale,
-            (245, 249, 255),
-            model_caption_thickness,
-            cv2.LINE_AA,
-        )
+        if not use_secondary_monitor:
+            model_caption = "Model"
+            model_caption_scale = screen_height / 558 * 0.48
+            model_caption_thickness = max(1, round(screen_height / 558 * 1.2))
+            (_, model_caption_height), _ = cv2.getTextSize(
+                model_caption,
+                cv2.FONT_HERSHEY_DUPLEX,
+                model_caption_scale,
+                model_caption_thickness,
+            )
+            cv2.putText(
+                display,
+                model_caption,
+                (
+                    model_label_left + round(model_caption_area_width * 0.43),
+                    control_center_y + model_caption_height // 2,
+                ),
+                cv2.FONT_HERSHEY_DUPLEX,
+                model_caption_scale,
+                (245, 249, 255),
+                model_caption_thickness,
+                cv2.LINE_AA,
+            )
 
         dropdown_radius = max(10, round(model_control_height * 0.18))
         draw_rounded_rectangle(
@@ -1208,33 +1408,25 @@ try:
             )
         cv2.fillPoly(display, [arrow_points], (30, 35, 50))
 
-        change_radius = max(10, round(model_control_height * 0.18))
-        draw_rounded_rectangle(
+        draw_control_icon_button(
             display,
-            (
-                model_change_x - 2,
-                model_control_y - 2,
-                model_change_x + model_change_width + 2,
-                model_control_y + model_control_height + 2,
-            ),
-            (35, 205, 255),
-            change_radius + 2,
+            model_change_x,
+            model_control_y,
+            model_change_width,
+            model_control_height,
+            icon_button_radius,
         )
-        fill_rounded_gradient(
-            display,
-            (
-                model_change_x,
-                model_control_y,
-                model_change_x + model_change_width,
-                model_control_y + model_control_height,
-            ),
-            (35, 150, 255),
-            (0, 86, 225),
-            change_radius,
+        change_icon_radius = max(
+            9,
+            round(model_control_height * (0.30 if use_secondary_monitor else 0.20)),
         )
-        change_icon_radius = max(9, round(model_control_height * 0.20))
         change_icon_center = (
-            model_change_x + round(model_change_width * 0.25),
+            model_change_x
+            + (
+                model_change_width // 2
+                if use_secondary_monitor
+                else round(model_change_width * 0.25)
+            ),
             control_center_y,
         )
         draw_refresh_icon(
@@ -1244,39 +1436,40 @@ try:
             (255, 255, 255),
             max(2, round(screen_height / 558 * 2)),
         )
-        change_label = "Change"
-        change_scale = screen_height / 558 * 0.58
-        change_thickness = max(1, round(screen_height / 558 * 1.3))
-        (change_text_width, change_text_height), _ = cv2.getTextSize(
-            change_label,
-            cv2.FONT_HERSHEY_DUPLEX,
-            change_scale,
-            change_thickness,
-        )
-        change_text_left = model_change_x + round(model_change_width * 0.43)
-        change_text_right = model_change_x + round(model_change_width * 0.94)
-        if change_text_width > change_text_right - change_text_left:
-            change_scale *= (change_text_right - change_text_left) / change_text_width
-            change_thickness = max(1, round(change_thickness * 0.9))
+        if not use_secondary_monitor:
+            change_label = "Change"
+            change_scale = screen_height / 558 * 0.58
+            change_thickness = max(1, round(screen_height / 558 * 1.3))
             (change_text_width, change_text_height), _ = cv2.getTextSize(
                 change_label,
                 cv2.FONT_HERSHEY_DUPLEX,
                 change_scale,
                 change_thickness,
             )
-        cv2.putText(
-            display,
-            change_label,
-            (
-                change_text_left + (change_text_right - change_text_left - change_text_width) // 2,
-                control_center_y + change_text_height // 2,
-            ),
-            cv2.FONT_HERSHEY_DUPLEX,
-            change_scale,
-            (255, 255, 255),
-            change_thickness,
-            cv2.LINE_AA,
-        )
+            change_text_left = model_change_x + round(model_change_width * 0.43)
+            change_text_right = model_change_x + round(model_change_width * 0.94)
+            if change_text_width > change_text_right - change_text_left:
+                change_scale *= (change_text_right - change_text_left) / change_text_width
+                change_thickness = max(1, round(change_thickness * 0.9))
+                (change_text_width, change_text_height), _ = cv2.getTextSize(
+                    change_label,
+                    cv2.FONT_HERSHEY_DUPLEX,
+                    change_scale,
+                    change_thickness,
+                )
+            cv2.putText(
+                display,
+                change_label,
+                (
+                    change_text_left + (change_text_right - change_text_left - change_text_width) // 2,
+                    control_center_y + change_text_height // 2,
+                ),
+                cv2.FONT_HERSHEY_DUPLEX,
+                change_scale,
+                (255, 255, 255),
+                change_thickness,
+                cv2.LINE_AA,
+            )
 
         if model_dropdown_open:
             for option_index, model_number in enumerate(MODEL_OPTIONS):
@@ -1409,6 +1602,10 @@ try:
 
         cv2.imshow(window_name, display)
         key = cv2.waitKey(1) & 0xFF
+        if not window_positioned:
+            window_positioned = fit_window_to_secondary_monitor()
+            if window_positioned:
+                print("Aplikasi tampil dan fokus di monitor kedua.")
 
         if key in (ord("s"), ord("S")):
             filename = datetime.now().strftime("tray_%Y%m%d_%H%M%S_%f.jpg")
